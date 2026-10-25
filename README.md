@@ -23,7 +23,7 @@ You can also run `cargo run` for a native window. Linux builds need X11 developm
 | Pan | Shift + left drag, or middle mouse drag |
 | Zoom | Mouse wheel or trackpad scroll |
 | Change projection | Perspective / Orthographic buttons |
-| Standard views | Click a face of the orientation cube or any of its six view buttons |
+| Standard views | Click a face, beveled edge, or beveled corner of the orientation cube |
 | Reset view | Home |
 | Fit models | Frame all, or select a hierarchy node and Frame selection |
 | Toggle construction grid | Grid |

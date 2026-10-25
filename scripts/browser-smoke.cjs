@@ -61,7 +61,11 @@ const server = http.createServer((req, res) => {
     await page.screenshot({ path: path.join(output, '03-orbit-zoom.png') });
     await page.mouse.click(524, 85);
     await page.waitForTimeout(1000);
-    await page.mouse.click(1198, 303);
+    await page.mouse.click(1310, 85);
+    await page.waitForTimeout(1000);
+    await page.mouse.click(524, 85);
+    await page.waitForTimeout(1000);
+    await page.mouse.click(1264, 170);
     await page.waitForTimeout(2500);
     await page.screenshot({ path: path.join(output, '04-orthographic.png') });
     // Expand the scene and assembly, then select the named cube subtree.

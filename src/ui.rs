@@ -320,7 +320,7 @@ pub fn workspace_ui(
     state.viewport = rect;
     let cube_rect = egui::Rect::from_min_size(
         egui::pos2((rect.right() - 178.0).max(rect.left()), rect.top() + 16.0),
-        egui::vec2(164.0, 224.0),
+        egui::vec2(164.0, 166.0),
     );
     // Cube uses its own foreground area; the rest of the viewport stays available to Bevy.
     egui::Area::new("viewcube".into())
@@ -330,25 +330,6 @@ pub fn workspace_ui(
             facing = orientation_cube(ui, transform.rotation);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("ORIENTATION").size(9.0).color(MUTED));
-                ui.horizontal(|ui| {
-                    for (label, dir) in [
-                        ("Top", Vec3::NEG_Y),
-                        ("Front", Vec3::NEG_Z),
-                        ("Right", Vec3::NEG_X),
-                    ] {
-                        if ui.small_button(label).clicked() {
-                            facing = Some(dir);
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    for (label, dir) in [("Bottom", Vec3::Y), ("Back", Vec3::Z), ("Left", Vec3::X)]
-                    {
-                        if ui.small_button(label).clicked() {
-                            facing = Some(dir);
-                        }
-                    }
-                });
             });
         });
     state.pointer_in_viewport = ctx
@@ -406,7 +387,7 @@ pub fn workspace_ui(
             ui.label("A 3D inspection workspace built with Bevy and egui.");
             ui.separator();
             egui::Grid::new("help_controls").spacing([24.0, 12.0]).show(ui, |ui| {
-                for (key, action) in [("Left or right drag", "Orbit the view"), ("Shift + drag / middle drag", "Pan the view"), ("Mouse wheel / trackpad scroll", "Zoom in and out"), ("Cube face / view labels", "Snap to a standard view"), ("Perspective / Orthographic", "Switch camera projection"), ("Frame all / Frame selection", "Fit models into the viewport")] {
+                for (key, action) in [("Left or right drag", "Orbit the view"), ("Shift + drag / middle drag", "Pan the view"), ("Mouse wheel / trackpad scroll", "Zoom in and out"), ("Cube face / edge / corner", "Snap to a straight or oblique view"), ("Perspective / Orthographic", "Switch camera projection"), ("Frame all / Frame selection", "Fit models into the viewport")] {
                     ui.strong(key); ui.label(action); ui.end_row();
                 }
             });
@@ -435,9 +416,9 @@ pub fn workspace_ui(
         look.write(LookToTrigger {
             camera: camera_entity,
             target_facing_direction: direction.as_dvec3(),
-            target_up_direction: if direction.y < -0.5 {
+            target_up_direction: if direction.y < -0.999 {
                 DVec3::NEG_Z
-            } else if direction.y > 0.5 {
+            } else if direction.y > 0.999 {
                 DVec3::Z
             } else {
                 DVec3::Y
@@ -569,8 +550,80 @@ fn inside_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
     true
 }
 
-/// Render the cube from the inverse camera rotation, so every face follows the
-/// real viewport orientation, including while the controller animates a snap.
+/// A chamfered cube has 26 distinct picking surfaces: six faces, twelve
+/// edge bevels and eight corner bevels. The surface normal is the viewing
+/// direction, so oblique views follow the same geometry that the user clicks.
+struct CubeSurface {
+    normal: Vec3,
+    vertices: Vec<Vec3>,
+    label: Option<&'static str>,
+    bevel: u8,
+}
+
+fn cube_surfaces() -> Vec<CubeSurface> {
+    const INSET: f32 = 0.72;
+    let mut surfaces = Vec::with_capacity(26);
+    for (normal, u, v, label) in [
+        (Vec3::Y, Vec3::X, Vec3::Z, "TOP"),
+        (Vec3::NEG_Y, Vec3::X, Vec3::NEG_Z, "BOTTOM"),
+        (Vec3::Z, Vec3::X, Vec3::Y, "FRONT"),
+        (Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y, "BACK"),
+        (Vec3::X, Vec3::NEG_Z, Vec3::Y, "RIGHT"),
+        (Vec3::NEG_X, Vec3::Z, Vec3::Y, "LEFT"),
+    ] {
+        surfaces.push(CubeSurface {
+            normal,
+            vertices: [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                .map(|(x, y)| normal + (u * x + v * y) * INSET)
+                .to_vec(),
+            label: Some(label),
+            bevel: 0,
+        });
+    }
+    for (a, b, along) in [
+        (Vec3::X, Vec3::Y, Vec3::Z),
+        (Vec3::X, Vec3::Z, Vec3::Y),
+        (Vec3::Y, Vec3::Z, Vec3::X),
+    ] {
+        for sign_a in [-1.0, 1.0] {
+            for sign_b in [-1.0, 1.0] {
+                let a = a * sign_a;
+                let b = b * sign_b;
+                surfaces.push(CubeSurface {
+                    normal: (a + b).normalize(),
+                    vertices: vec![
+                        a + b * INSET - along * INSET,
+                        a * INSET + b - along * INSET,
+                        a * INSET + b + along * INSET,
+                        a + b * INSET + along * INSET,
+                    ],
+                    label: None,
+                    bevel: 1,
+                });
+            }
+        }
+    }
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            for z in [-1.0, 1.0] {
+                let (a, b, c) = (Vec3::X * x, Vec3::Y * y, Vec3::Z * z);
+                surfaces.push(CubeSurface {
+                    normal: (a + b + c).normalize(),
+                    vertices: vec![
+                        a + (b + c) * INSET,
+                        b + (a + c) * INSET,
+                        c + (a + b) * INSET,
+                    ],
+                    label: None,
+                    bevel: 2,
+                });
+            }
+        }
+    }
+    surfaces
+}
+
+/// Render and hit-test the same polygons using the inverse camera rotation.
 fn orientation_cube(ui: &mut Ui, rotation: Quat) -> Option<Vec3> {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(164.0, 142.0), egui::Sense::click());
     let center = rect.center();
@@ -579,41 +632,36 @@ fn orientation_cube(ui: &mut Ui, rotation: Quat) -> Option<Vec3> {
         let p = view * v;
         center + egui::vec2(p.x, -p.y) * 33.0
     };
-    let specs = [
-        (Vec3::Y, Vec3::X, Vec3::Z, "TOP"),
-        (Vec3::NEG_Y, Vec3::X, Vec3::NEG_Z, "BOTTOM"),
-        (Vec3::Z, Vec3::X, Vec3::Y, "FRONT"),
-        (Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y, "BACK"),
-        (Vec3::X, Vec3::NEG_Z, Vec3::Y, "RIGHT"),
-        (Vec3::NEG_X, Vec3::Z, Vec3::Y, "LEFT"),
-    ];
-    let mut faces: Vec<_> = specs
+    let mut surfaces: Vec<_> = cube_surfaces()
         .into_iter()
-        .filter(|(n, ..)| (view * *n).z > 0.001)
+        .filter(|surface| (view * surface.normal).z > 0.001)
         .collect();
-    faces.sort_by(|a, b| (view * a.0).z.total_cmp(&(view * b.0).z));
+    surfaces.sort_by(|a, b| {
+        let depth = |surface: &CubeSurface| {
+            surface.vertices.iter().map(|v| (view * *v).z).sum::<f32>()
+                / surface.vertices.len() as f32
+        };
+        depth(a).total_cmp(&depth(b))
+    });
     let pointer = response.hover_pos();
     let mut clicked = None;
-    for (normal, u, v, label) in faces {
-        let polygon: Vec<Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-            .iter()
-            .map(|(x, y)| project(normal + u * *x + v * *y))
-            .collect();
+    for surface in surfaces {
+        let polygon: Vec<Pos2> = surface.vertices.iter().map(|v| project(*v)).collect();
         let hovered = pointer.is_some_and(|p| inside_polygon(p, &polygon));
-        let shade = (view * normal).z;
+        let shade = (view * surface.normal).z;
         let fill = if hovered {
             ACCENT
         } else {
-            Color32::from_gray((60.0 + shade * 45.0) as u8)
+            Color32::from_gray((60.0 + surface.bevel as f32 * 15.0 + shade * 40.0) as u8)
         };
         ui.painter().add(egui::Shape::convex_polygon(
             polygon,
             fill,
-            Stroke::new(1.5, Color32::from_rgb(27, 32, 39)),
+            Stroke::new(1.0, Color32::from_rgb(27, 32, 39)),
         ));
-        if shade > 0.25 {
+        if let Some(label) = surface.label.filter(|_| shade > 0.25) {
             ui.painter().text(
-                project(normal),
+                project(surface.normal),
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::proportional(10.0),
@@ -626,8 +674,13 @@ fn orientation_cube(ui: &mut Ui, rotation: Quat) -> Option<Vec3> {
         }
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            response.clone().on_hover_text(match surface.bevel {
+                0 => "Face view",
+                1 => "Edge view · 45°",
+                _ => "Corner view · isometric",
+            });
             if response.clicked() {
-                clicked = Some(-normal);
+                clicked = Some(-surface.normal);
             }
         }
     }
