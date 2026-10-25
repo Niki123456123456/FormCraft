@@ -46,6 +46,16 @@ const server = http.createServer((req, res) => {
     await page.waitForTimeout(4000);
     await page.screenshot({ path: path.join(output, '02-imported.png') });
     const clip = { x: 450, y: 260, width: 500, height: 360 };
+    const cubeBefore = await page.screenshot({ clip });
+    await page.mouse.move(1250, 205);
+    await page.mouse.down();
+    await page.mouse.move(1130, 245, { steps: 12 });
+    await page.mouse.up();
+    await page.waitForTimeout(600);
+    const cubeAfter = await page.screenshot({ clip });
+    assert(!cubeBefore.equals(cubeAfter), 'Dragging the cube must rotate the viewport, including outside its bounds');
+    await page.waitForTimeout(500);
+    assert(cubeAfter.equals(await page.screenshot({ clip })), 'Releasing a cube drag must keep its orientation without snapping');
     const before = await page.screenshot({ clip });
     await page.mouse.move(710, 450);
     await page.mouse.down();

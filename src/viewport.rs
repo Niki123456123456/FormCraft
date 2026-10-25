@@ -3,7 +3,9 @@ use bevy::{
     camera::primitives::Aabb,
     camera_controller::pan_orbit_camera::prelude::*,
     input::mouse::{AccumulatedMouseMotion, MouseScrollUnit, MouseWheel},
+    math::{DQuat, DVec3},
     prelude::*,
+    window::PrimaryWindow,
 };
 
 #[derive(Component)]
@@ -21,10 +23,24 @@ pub fn camera_input(
     mut dragging: Local<Option<MouseButton>>,
     mut zoom_idle: Local<f32>,
     time: Res<Time>,
+    window: Single<&Window, With<PrimaryWindow>>,
 ) {
     let Ok(mut camera) = camera.single_mut() else {
         return;
     };
+    if state.cube_owns_pointer {
+        wheel.clear();
+        *dragging = None;
+        *zoom_idle = 0.0;
+        return;
+    }
+    // Use this frame's cursor position, so a quick move onto the cube cannot
+    // accidentally start a viewport orbit using the previous frame's hover.
+    let pointer_in_viewport = window.cursor_position().is_some_and(|position| {
+        let p = position * window.scale_factor() / state.pixels_per_point;
+        let p = bevy_egui::egui::pos2(p.x, p.y);
+        state.viewport.contains(p) && !state.cube_rect.contains(p)
+    }) && !state.help;
     let zoom: f32 = wheel
         .read()
         .map(|e| {
@@ -41,7 +57,7 @@ pub fn camera_input(
             *dragging = None;
         }
     }
-    if state.pointer_in_viewport && dragging.is_none() {
+    if pointer_in_viewport && dragging.is_none() {
         let pan = buttons.just_pressed(MouseButton::Middle)
             || (buttons.just_pressed(MouseButton::Left) && keys.pressed(KeyCode::ShiftLeft));
         let orbit = buttons.just_pressed(MouseButton::Right)
@@ -67,7 +83,7 @@ pub fn camera_input(
     if dragging.is_some() {
         camera.send_screenspace_input(motion.delta);
     }
-    if state.pointer_in_viewport && zoom != 0.0 {
+    if pointer_in_viewport && zoom != 0.0 {
         *zoom_idle = 0.2;
         if dragging.is_none() {
             camera.start_zoom(None);
@@ -200,4 +216,21 @@ pub fn settle_imports(
             }
         }
     }
+}
+
+/// Tumble around the existing focus point, preserving pan, distance and zoom.
+/// Double precision keeps the pivot stable for distant orthographic cameras.
+pub fn orbit_from_cube(transform: &mut Transform, anchor_depth: f64, delta: Vec2) {
+    if delta == Vec2::ZERO {
+        return;
+    }
+    let rotation = transform.rotation.as_dquat();
+    let depth = anchor_depth.abs();
+    let pivot = transform.translation.as_dvec3() + rotation * DVec3::NEG_Z * depth;
+    let next = (rotation
+        * DQuat::from_rotation_y(-delta.x as f64 * 0.0125)
+        * DQuat::from_rotation_x(-delta.y as f64 * 0.0125))
+    .normalize();
+    transform.translation = (pivot - next * DVec3::NEG_Z * depth).as_vec3();
+    transform.rotation = next.as_quat();
 }

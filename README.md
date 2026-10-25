@@ -20,6 +20,7 @@ You can also run `cargo run` for a native window. Linux builds need X11 developm
 | Action | Control |
 | --- | --- |
 | Orbit | Left or right mouse drag |
+| Rotate using the orientation cube | Drag a cube surface; release to keep the orientation |
 | Pan | Shift + left drag, or middle mouse drag |
 | Zoom | Mouse wheel or trackpad scroll |
 | Change projection | Perspective / Orthographic buttons |

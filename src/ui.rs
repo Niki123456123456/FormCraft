@@ -5,7 +5,10 @@ use crate::{
 use bevy::{
     camera::{Viewport, primitives::Aabb},
     camera_controller::pan_orbit_camera::{
-        extensions::{dolly_zoom::DollyZoomTrigger, look_to::LookToTrigger},
+        extensions::{
+            dolly_zoom::DollyZoomTrigger,
+            look_to::{LookTo, LookToTrigger},
+        },
         prelude::*,
     },
     math::DVec3,
@@ -25,7 +28,9 @@ pub struct Workspace {
     pub show_grid: bool,
     pub orthographic: bool,
     pub selected: Option<Entity>,
-    pub pointer_in_viewport: bool,
+    pub cube_rect: egui::Rect,
+    pub pixels_per_point: f32,
+    pub cube_owns_pointer: bool,
     pub viewport: egui::Rect,
     pub help: bool,
     pub ready_frames: u8,
@@ -36,7 +41,9 @@ impl Default for Workspace {
             show_grid: true,
             orthographic: false,
             selected: None,
-            pointer_in_viewport: false,
+            cube_rect: egui::Rect::NOTHING,
+            pixels_per_point: 1.0,
+            cube_owns_pointer: false,
             viewport: egui::Rect::NOTHING,
             help: false,
             ready_frames: 0,
@@ -91,6 +98,7 @@ pub fn workspace_ui(
     children: Query<&Children>,
     meshes: Query<(&Aabb, &GlobalTransform), With<Mesh3d>>,
     mut look: MessageWriter<LookToTrigger>,
+    mut look_animation: ResMut<LookTo>,
     mut dolly: MessageWriter<DollyZoomTrigger>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -115,7 +123,7 @@ pub fn workspace_ui(
     let mut home = false;
     let mut toggle_projection = false;
     let mut remove = None;
-    let mut facing = None;
+    let mut cube = CubeInteraction::default();
     let mut ui = Ui::new(
         ctx.clone(),
         "workspace".into(),
@@ -327,15 +335,26 @@ pub fn workspace_ui(
         .fixed_pos(cube_rect.min)
         .show(ctx, |ui| {
             ui.set_min_width(164.0);
-            facing = orientation_cube(ui, transform.rotation);
+            cube = orientation_cube(ui, transform.rotation);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("ORIENTATION").size(9.0).color(MUTED));
             });
         });
-    state.pointer_in_viewport = ctx
-        .pointer_hover_pos()
-        .is_some_and(|p| rect.contains(p) && !cube_rect.contains(p))
-        && !state.help;
+    if cube.owns_pointer {
+        if !state.cube_owns_pointer {
+            // A new direct gesture takes over from a pending animated snap.
+            *look_animation = LookTo::default();
+        }
+        controller.current_motion = motion::CurrentMotion::Stationary;
+        viewport::orbit_from_cube(
+            &mut transform,
+            controller.last_anchor_depth(),
+            cube.drag_delta,
+        );
+    }
+    state.cube_owns_pointer = cube.owns_pointer;
+    state.cube_rect = cube_rect;
+    state.pixels_per_point = ctx.pixels_per_point();
     let painter = ctx.layer_painter(LayerId::background());
     painter.text(
         rect.left_top() + egui::vec2(18.0, 20.0),
@@ -387,7 +406,7 @@ pub fn workspace_ui(
             ui.label("A 3D inspection workspace built with Bevy and egui.");
             ui.separator();
             egui::Grid::new("help_controls").spacing([24.0, 12.0]).show(ui, |ui| {
-                for (key, action) in [("Left or right drag", "Orbit the view"), ("Shift + drag / middle drag", "Pan the view"), ("Mouse wheel / trackpad scroll", "Zoom in and out"), ("Cube face / edge / corner", "Snap to a straight or oblique view"), ("Perspective / Orthographic", "Switch camera projection"), ("Frame all / Frame selection", "Fit models into the viewport")] {
+                for (key, action) in [("Left or right drag", "Orbit the view"), ("Shift + drag / middle drag", "Pan the view"), ("Mouse wheel / trackpad scroll", "Zoom in and out"), ("Click cube face / edge / corner", "Snap to a straight or oblique view"), ("Drag the orientation cube", "Rotate the view freely"), ("Perspective / Orthographic", "Switch camera projection"), ("Frame all / Frame selection", "Fit models into the viewport")] {
                     ui.strong(key); ui.label(action); ui.end_row();
                 }
             });
@@ -412,7 +431,7 @@ pub fn workspace_ui(
             },
         });
     }
-    if let Some(direction) = facing {
+    if let Some(direction) = cube.facing {
         look.write(LookToTrigger {
             camera: camera_entity,
             target_facing_direction: direction.as_dvec3(),
@@ -623,9 +642,17 @@ fn cube_surfaces() -> Vec<CubeSurface> {
     surfaces
 }
 
+#[derive(Default)]
+struct CubeInteraction {
+    facing: Option<Vec3>,
+    owns_pointer: bool,
+    drag_delta: Vec2,
+}
+
 /// Render and hit-test the same polygons using the inverse camera rotation.
-fn orientation_cube(ui: &mut Ui, rotation: Quat) -> Option<Vec3> {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(164.0, 142.0), egui::Sense::click());
+fn orientation_cube(ui: &mut Ui, rotation: Quat) -> CubeInteraction {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(164.0, 142.0), egui::Sense::click_and_drag());
     let center = rect.center();
     let view = rotation.inverse();
     let project = |v: Vec3| {
@@ -644,10 +671,56 @@ fn orientation_cube(ui: &mut Ui, rotation: Quat) -> Option<Vec3> {
         depth(a).total_cmp(&depth(b))
     });
     let pointer = response.hover_pos();
-    let mut clicked = None;
+    let press_id = response.id.with("surface_press");
+    if (response.is_pointer_button_down_on() || response.clicked())
+        && ui.input(|i| i.pointer.primary_pressed())
+    {
+        // Press and release can arrive in one frame; in that case egui has
+        // already cleared press_origin, but the raw press event is retained.
+        let origin = ui.input(|i| {
+            i.pointer.press_origin().or_else(|| {
+                i.events.iter().rev().find_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
+            })
+        });
+        let on_surface = origin.is_some_and(|p| {
+            surfaces.iter().any(|surface| {
+                let polygon: Vec<_> = surface.vertices.iter().map(|v| project(*v)).collect();
+                inside_polygon(p, &polygon)
+            })
+        });
+        ui.data_mut(|data| data.insert_temp(press_id, on_surface));
+    }
+    let valid_press = ui.data(|data| data.get_temp::<bool>(press_id).unwrap_or(false));
+    let drag_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
+    let dragging =
+        valid_press && (response.dragged_by(egui::PointerButton::Primary) || drag_stopped);
+    let delta = if response.drag_started() {
+        response.total_drag_delta().unwrap_or_default()
+    } else if drag_stopped {
+        ui.input(|i| i.pointer.delta())
+    } else {
+        response.drag_delta()
+    };
+    let mut interaction = CubeInteraction {
+        owns_pointer: valid_press && (response.is_pointer_button_down_on() || drag_stopped),
+        drag_delta: if dragging {
+            Vec2::new(delta.x, delta.y)
+        } else {
+            Vec2::ZERO
+        },
+        ..default()
+    };
     for surface in surfaces {
         let polygon: Vec<Pos2> = surface.vertices.iter().map(|v| project(*v)).collect();
-        let hovered = pointer.is_some_and(|p| inside_polygon(p, &polygon));
+        let hovered = !dragging && pointer.is_some_and(|p| inside_polygon(p, &polygon));
         let shade = (view * surface.normal).z;
         let fill = if hovered {
             ACCENT
@@ -673,16 +746,22 @@ fn orientation_cube(ui: &mut Ui, rotation: Quat) -> Option<Vec3> {
             );
         }
         if hovered {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             response.clone().on_hover_text(match surface.bevel {
-                0 => "Face view",
-                1 => "Edge view · 45°",
-                _ => "Corner view · isometric",
+                0 => "Click for face view · drag to rotate",
+                1 => "Click for edge view · drag to rotate",
+                _ => "Click for corner view · drag to rotate",
             });
-            if response.clicked() {
-                clicked = Some(-surface.normal);
+            if valid_press && response.clicked() {
+                interaction.facing = Some(-surface.normal);
             }
         }
     }
-    clicked
+    if dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    if !ui.input(|i| i.pointer.primary_down()) {
+        ui.data_mut(|data| data.remove::<bool>(press_id));
+    }
+    interaction
 }
